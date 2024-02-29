@@ -1,0 +1,176 @@
+<?php
+/**
+ * @file
+ * Author : Sachin Doijad
+ */
+
+
+/**
+ * Implements hook_menu().
+ */
+function webform_civicrm_cividiscount_menu() {
+  // Ajax request for Getting the Discounted code from CIVI API
+  $items['validate/discount/%'] = array(
+    'page callback' => '_validate_discount_code',
+    'page arguments' => array(2),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  // Ajax request for Getting the Discounted code from CIVI API
+  $items['get/event_fees/%'] = array(
+    'page callback' => '_get_event_fees',
+    'page arguments' => array(2),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function webform_civicrm_cividiscount_form_alter(&$form, &$form_state, $form_id) {
+  if (strpos($form_id, 'webform_client_form_') !== FALSE) {
+    drupal_add_library('system', 'ui.dialog');
+  }
+}
+
+/**
+ * Implements hook_webform_submission_insert().
+ * Uses cached instance of wf_crm_webform_postprocess that was created during validation.
+ */
+function webform_civicrm_cividiscount_webform_submission_insert($node, $submission) {
+  if (!empty($node->webform_civicrm)) {
+    module_load_include('inc', 'webform_civicrm_cividiscount', 'includes/wf_crm_webform_discount_postprocess');
+    $processor = wf_crm_webform_discount_postprocess::singleton($node);
+    $processor->postSave($submission, $node);
+  }
+}
+
+/**
+ * Implements hook_webform_submission_update().
+ * Uses cached instance of wf_crm_webform_postprocess that was created during validation.
+ */
+function webform_civicrm_cividiscount_webform_submission_update($node, $submission) {
+  if (!empty($node->webform_civicrm)) {
+    module_load_include('inc', 'webform_civicrm_cividiscount', 'includes/wf_crm_webform_discount_postprocess');
+    $processor = wf_crm_webform_discount_postprocess::singleton($node);
+    $processor->postSave($submission, $node);
+  }
+}
+
+/**
+ * Implements hook_civicrm_post().
+ */
+function webform_civicrm_cividiscount_civicrm_post($op, $name, $id, $dao) {
+  global $participant_arr;
+
+  if($name == 'Participant' && $op == 'create') {
+    $participant_arr[$dao->contact_id][$dao->event_id] = array('pid' =>$dao->id, 'event_id'=>$dao->event_id);
+  }
+}
+
+// AJAX call to validate Discount Code
+function _validate_discount_code($code) {
+  if(isset($code) && !empty($code)) {
+    if ( ! civicrm_initialize( ) ) {
+      return;
+    }
+
+    $discount_details =  civicrm_api3('DiscountCode', 'get', array(
+      'sequential' => 1,
+      'code' => trim($code),
+    ));
+
+    $message = $output = '';
+    $value = 0;
+    if($discount_details['is_error'] ==0 && !empty($discount_details['values'])) {
+      // Check for InActive Discount
+      $discount_val = $discount_details['values'][0];
+      $discount_start_timestamp = strtotime($discount_val['active_on']);
+      $discount_end_timestamp = strtotime($discount_val['expire_on']);
+      $current_date_timestamp = time();
+
+      $max_count  = $discount_val['count_max'];
+      $used_count = $discount_val['count_use'];
+      // 1. Check If status of code is Active/InActive
+      if ($discount_val['is_active'] == 0) {
+        $message = "The discount code is inactive";
+        $status  = 'fail';
+      } // 2. Check If Discount start/end date exists & compare with Expiration Date with Current Date
+      else if ((!empty($discount_start_timestamp) || !empty($discount_end_timestamp)) && (($current_date_timestamp > $discount_end_timestamp))) {
+        $message = "The discount code is no longer valid";
+        $status  = 'fail';
+      } // 3. Check If Discount start/end date exists & compare with Activation Date with Current Date
+      else if ((!empty($discount_start_timestamp) || !empty($discount_end_timestamp)) && (($current_date_timestamp < $discount_start_timestamp))) {
+        $message = "The discount code is inactive";
+        $status  = 'fail';
+      } // 4. Check If Code limit has been expired or not
+      else if ($max_count != 0 && $max_count == $used_count) {
+        // Max count = 0 means 'Unlimited'
+        $message = "The discount code limit usage has been reached";
+        $status  = 'fail';
+      }
+      else if(isset($discount_details['values'][0])) {
+        $discount_format = array();
+        $discount_values =  $discount_details['values'][0];
+        if(isset($discount_values['amount_type']) && $discount_values['amount_type'] == 1) {
+          $discount_format['percentage'] = $discount_values['amount'];
+          $discount_format['amount']     = 0;
+        } else if(isset($discount_values['amount_type']) && $discount_values['amount_type'] == 2) {
+          $discount_format['percentage'] = 0;
+          $discount_format['amount']     = $discount_values['amount'];
+        }
+
+        // Get the usable max limit ( i.e. limit remains after used )
+        if($max_count != 0) {
+          $usable_max_count = $max_count - $used_count;
+        }
+        $discount_format['usable_limit'] = $usable_max_count;
+        $discount_format['limit']        = $max_count;
+
+        $status  = 'success';
+        $value   = $discount_format;
+      }
+
+      $output = array("status" => $status, "messages" => $message, "discount" => $value);
+    } else if($discount_details['is_error'] ==0 && empty($discount_details['values'])) {
+      // Discount code does not exists
+      $message = "The discount code is no longer valid";
+      $status  = 'fail';
+      $output  = array("status" => $status, "messages" => $message, "discount" => $value);
+    }
+  }
+
+  return drupal_json_output($output);
+}
+
+// Ajax call to get Event Fees By Event Id
+function _get_event_fees($eventId) {
+  if ( ! civicrm_initialize( ) ) {
+    return;
+  }
+  if(empty($eventId)) {
+    return;
+  }
+  $sql = "select SUM(civicrm_price_field_value.amount) as price_amount
+            from civicrm_price_set
+            inner join civicrm_price_set_entity ON (civicrm_price_set_entity.entity_table = 'civicrm_event' AND civicrm_price_set_entity.price_set_id = civicrm_price_set.id)
+            inner join civicrm_price_field ON (civicrm_price_field.price_set_id = civicrm_price_set.id)
+            inner join civicrm_price_field_value ON (civicrm_price_field_value.price_field_id = civicrm_price_field.id) 
+            WHERE civicrm_price_set_entity.entity_id IN (" .  $eventId . ")";
+
+  $price = $event_price = 0;
+  $dao = CRM_Core_DAO::executeQuery( $sql );
+  while ($dao->fetch()) {
+    $price = $dao->price_amount;
+  }
+
+  // For Free Events set the Fees = 0;
+  if(!empty($price)) {
+    $output = array("status" => "success", "values" => $price);
+  } else {
+    $output = array("status" => "success", "values" => 0);
+  }
+  return drupal_json_output($output);
+}
